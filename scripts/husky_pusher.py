@@ -1,311 +1,566 @@
-################################################################################
-#                                                                              #
-#                    PARTE 2:  Husky A200  (skid-steer 4 ruedas)               #
-#                                                                              #
-################################################################################
-import matplotlib as mpl
+"""
+husky_pusher.py  —  Fase 1: Husky A200 despeja el corredor
+===========================================================
+Fases: SCAN → ALIGN → APPROACH → PUSH → NEXT → DONE
+"""
+
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib import animation
+from pathlib import Path
 
+# ── Constantes ────────────────────────────────────────────────────────────────
+HUSKY_W    = 0.90
+HUSKY_H    = 0.58
+BOX_S      = 0.55                          # lado de la caja [m]
+LANE_Y     = +0.72                         # carril superior
+CONTACT    = HUSKY_W/2 + BOX_S/2          # 0.725 m  (centro-centro al contactar)
+STAGE      = CONTACT  + 0.30              # 1.025 m  (staging a la derecha)
+PUSH_V     = 0.35                          # m/s de empuje
+EXIT_X     = -0.35                         # caja "fuera" cuando box.x < EXIT_X
+COL_MARGIN = 0.03                          # holgura en colisión [m]
+
+# Carril central
+def _draw_world(ax, show_side_zones=True):
+    ax.set_xlim(-4.5, 12.5)
+    ax.set_ylim(-2.0, 2.0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25)
+    ax.axvline(0.0, color="gray", lw=1.0, ls="--", alpha=0.5)
+    ax.axvline(6.0, color="gray", lw=1.0, ls="--", alpha=0.5)
+    ax.axhline(-1.0, color="gray", lw=1.0, ls=":", alpha=0.6)
+    ax.axhline(1.0, color="gray", lw=1.0, ls=":", alpha=0.6)
+    ax.axhline(LANE_Y, color="#1f77b4", lw=1.2, ls="-.", alpha=0.7)
+
+    ax.add_patch(mpatches.Rectangle((0.0, -1.0), 6.0, 2.0,
+                                    facecolor="#fff8e8", edgecolor="none", alpha=0.45))
+    if show_side_zones:
+        ax.add_patch(mpatches.Rectangle((-4.0, -2.0), 4.0, 4.0,
+                                        facecolor="#e9f5ff", edgecolor="none", alpha=0.35))
+        ax.add_patch(mpatches.Rectangle((6.0, -2.0), 6.0, 4.0,
+                                        facecolor="#ecffef", edgecolor="none", alpha=0.35))
+
+    ax.set_xlabel("x [m]")
+    ax.set_ylabel("y [m]")
+
+# POligono orientado del Husky para visualización
+def _robot_corners(x, y, theta):
+    local = np.array([
+        [-HUSKY_W/2, -HUSKY_H/2],
+        [ HUSKY_W/2, -HUSKY_H/2],
+        [ HUSKY_W/2,  HUSKY_H/2],
+        [-HUSKY_W/2,  HUSKY_H/2],
+    ])
+    ct, st = np.cos(theta), np.sin(theta)
+    rot = np.array([[ct, -st], [st, ct]])
+    return local @ rot.T + np.array([x, y])
+
+
+# Polígono orientado del Husky para visualización (patch de Matplotlib)
+def _robot_patch(x, y, theta, facecolor="#2b2d42"):
+    return mpatches.Polygon(
+        _robot_corners(x, y, theta),
+        closed=True,
+        facecolor=facecolor,
+        edgecolor="black",
+        linewidth=1.2,
+        zorder=4,
+    )
+
+# Guardar imagen resumen con trayectoria y estado final
+def save_husky_snapshot(log, boxes, out_path):
+    """Guarda una imagen resumen con trayectoria y estado final."""
+    fig, ax = plt.subplots(figsize=(12, 5))
+    _draw_world(ax)
+    ax.set_title("Husky A200 - Fase 1 (trayectoria y estado final)")
+
+    x = np.array(log["x"])
+    y = np.array(log["y"])
+    th = np.array(log["theta"])
+
+    ax.plot(x, y, color="#0b5d1e", lw=2.0, label="Trayectoria Husky", zorder=3)
+    ax.scatter([x[0]], [y[0]], s=50, color="#1f77b4", zorder=5, label="Inicio Husky")
+    ax.scatter([x[-1]], [y[-1]], s=55, color="#d62728", zorder=5, label="Fin Husky")
+
+    robot = _robot_patch(x[-1], y[-1], th[-1])
+    ax.add_patch(robot)
+
+    for b in boxes:
+        color = "#2ca02c" if not b.active else "#ff7f0e"
+        label = f"Caja {b.name} ({'fuera' if not b.active else 'activa'})"
+        ax.add_patch(mpatches.Rectangle(
+            (b.x - b.w/2, b.y - b.h/2), b.w, b.h,
+            facecolor=color, edgecolor="black", alpha=0.75, zorder=4, label=label
+        ))
+
+    handles, labels = ax.get_legend_handles_labels()
+    uniq = {}
+    for h, l in zip(handles, labels):
+        if l not in uniq:
+            uniq[l] = h
+    ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=9)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
+
+
+# Guardar animación GIF de la simulación
+def save_husky_gif(log, out_path, step_stride=4, fps=15):
+    """Guarda GIF de la simulación usando muestras del log."""
+    x = np.array(log["x"])
+    y = np.array(log["y"])
+    th = np.array(log["theta"])
+    box_names = list(log["box_x"].keys())
+    bx = {k: np.array(v) for k, v in log["box_x"].items()}
+    by = {k: np.array(v) for k, v in log["box_y"].items()}
+
+    idx = np.arange(0, len(x), max(1, step_stride), dtype=int)
+    if idx[-1] != len(x) - 1:
+        idx = np.append(idx, len(x) - 1)
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    _draw_world(ax, show_side_zones=False)
+    ax.set_title("Husky A200 - Fase 1 (animacion)")
+
+    path_line, = ax.plot([], [], color="#0b5d1e", lw=2.0, zorder=3)
+    husky = _robot_patch(x[0], y[0], th[0])
+    ax.add_patch(husky)
+    heading, = ax.plot([], [], color="#111111", lw=2.0, zorder=5)
+    txt = ax.text(0.02, 0.96, "", transform=ax.transAxes, va="top", fontsize=10)
+
+    box_patches = {}
+    for name in box_names:
+        patch = mpatches.Rectangle((bx[name][0]-BOX_S/2, by[name][0]-BOX_S/2), BOX_S, BOX_S,
+                                   facecolor="#ff7f0e", edgecolor="black", alpha=0.8, zorder=4)
+        ax.add_patch(patch)
+        box_patches[name] = patch
+
+    def _update(k):
+        i = idx[k]
+        path_line.set_data(x[:i+1], y[:i+1])
+
+        husky.set_xy(_robot_corners(x[i], y[i], th[i]))
+
+        hx2 = x[i] + 0.45*np.cos(th[i])
+        hy2 = y[i] + 0.45*np.sin(th[i])
+        heading.set_data([x[i], hx2], [y[i], hy2])
+
+        for name in box_names:
+            box_patches[name].set_xy((bx[name][i]-BOX_S/2, by[name][i]-BOX_S/2))
+            if bx[name][i] < EXIT_X:
+                box_patches[name].set_facecolor("#2ca02c")
+
+        txt.set_text(f"t = {log['t'][i]:.1f} s | estado = {log['state'][i]}")
+        return [path_line, husky, heading, txt, *box_patches.values()]
+
+    ani = animation.FuncAnimation(fig, _update, frames=len(idx), interval=1000/fps, blit=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    ani.save(out_path, writer=animation.PillowWriter(fps=fps))
+    plt.close(fig)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  Husky A200
+# ══════════════════════════════════════════════════════════════════════════════
 class HuskyA200:
-    """
-    Husky A200 de Clearpath Robotics - Robot skid-steer de 4 ruedas.
-
-    El skid-steer NO tiene mecanismo de direccion: el giro se logra
-    variando la velocidad entre los dos lados (como un tanque).
-    Esto implica deslizamiento lateral durante el giro.
-    """
+    """Skid-steer 4 ruedas con factor de deslizamiento."""
 
     def __init__(self, r=0.1651, B=0.555, mass=50.0):
-        # --- Parametros geometricos ---
-        self.r = r              # Radio de la rueda [m]
-        self.B = B              # Distancia efectiva entre lados [m]
-        # B debe calibrarse experimentalmente ya que el skid-steer
-        # tiene un "centro instantaneo de rotacion" (ICR) virtual
-
-        # --- Parametros inerciales ---
-        self.mass = mass        # Masa [kg] sin payload
-        self.payload_max = 75.0 # Payload maximo [kg]
-
-        # --- Estado (pose y velocidades) ---
-        self.x, self.y, self.theta = 0.0, 0.0, 0.0
-        self.v, self.omega = 0.0, 0.0
-
-        # --- Terreno actual (afecta deslizamiento) ---
+        self.r, self.B, self.mass = r, B, mass
+        self.x = self.y = self.theta = 0.0
+        self.v = self.omega = 0.0
         self.terrain = "asphalt"
-        self._slip_factors = {
-            "asphalt": 1.00,    # Superficie ideal
-            "grass":   0.85,    # Pasto cortado
-            "gravel":  0.78,    # Grava suelta
-            "sand":    0.65,    # Arena
-            "mud":     0.50,    # Lodo
-        }
-
-    def start_task(self, dt): 
-        """
-        EJECUTAR ACCION -> mover objetos
-        Recibe intervalo de actualizacon (delta time)
-        
-        Regrea arreglo de numpy con las posiciones en x y y despues de realizar la tarea 
-        o None en caso de error o singularidad
-
-        """
-        return None
+        self._slip = {"asphalt":1.00,"grass":0.85,
+                      "gravel":0.78,"sand":0.65,"mud":0.50}
 
     def forward_kinematics(self, wR1, wR2, wL1, wL2):
-        """
-        Cinematica directa para skid-steer de 4 ruedas.
-
-        Entradas:
-            wR1, wR2 : velocidades ruedas derechas (frontal, trasera) [rad/s]
-            wL1, wL2 : velocidades ruedas izquierdas [rad/s]
-
-        Retorna:
-            (v, omega) : velocidades del cuerpo del robot
-
-        Complejidad: O(1)
-        """
-        # Promediar cada lado: el modelo asume ruedas del mismo lado
-        # giran a la misma velocidad (idealizacion)
-        avg_R = (wR1 + wR2) / 2.0
-        avg_L = (wL1 + wL2) / 2.0
-
-        # Aplicar factor de deslizamiento del terreno actual
-        slip = self._slip_factors.get(self.terrain, 0.8)
-
-        # Velocidades del cuerpo
-        v = self.r / 2.0 * (avg_R + avg_L) * slip
-        omega = self.r / self.B * (avg_R - avg_L)
-
-        return v, omega
+        s = self._slip.get(self.terrain, 0.8)
+        v = self.r/2 * ((wR1+wR2)/2 + (wL1+wL2)/2) * s
+        w = self.r/self.B * ((wR1+wR2)/2 - (wL1+wL2)/2)
+        return v, w
 
     def inverse_kinematics(self, v, omega):
-        """
-        Cinematica inversa: (v, omega) -> velocidades de las 4 ruedas.
-        Se asume que las ruedas de cada lado giran a la misma velocidad.
-        """
-        wR = (2.0 * v + omega * self.B) / (2.0 * self.r)
-        wL = (2.0 * v - omega * self.B) / (2.0 * self.r)
-        return wR, wR, wL, wL   # (wR1, wR2, wL1, wL2)
+        wR = (2*v + omega*self.B) / (2*self.r)
+        wL = (2*v - omega*self.B) / (2*self.r)
+        return wR, wR, wL, wL
 
     def update_pose(self, v, omega, dt):
-        """Integra la pose usando el metodo del punto medio (midpoint)."""
-        # Orientacion en el punto medio del intervalo (mas preciso que Euler)
-        theta_mid = self.theta + omega * dt / 2.0
-
-        self.x += v * np.cos(theta_mid) * dt
-        self.y += v * np.sin(theta_mid) * dt
-        self.theta += omega * dt
-        self.theta = np.arctan2(np.sin(self.theta), np.cos(self.theta))
-
-        # Guardar velocidades para el siguiente ciclo
+        tm = self.theta + omega*dt/2
+        self.x     += v*np.cos(tm)*dt
+        self.y     += v*np.sin(tm)*dt
+        self.theta += omega*dt
+        self.theta  = np.arctan2(np.sin(self.theta), np.cos(self.theta))
         self.v, self.omega = v, omega
 
-    def set_terrain(self, terrain_name):
-        """Cambia el terreno actual (afecta factor de deslizamiento)."""
-        self.terrain = terrain_name
-
-    def get_pose(self):
-        """Retorna la pose actual como tupla (x, y, theta)."""
-        return (self.x, self.y, self.theta)
-
-    def reset(self, x=0.0, y=0.0, theta=0.0):
-        """Resetea el estado del robot."""
+    def get_pose(self):  return (self.x, self.y, self.theta)
+    def reset(self, x=0., y=0., theta=0.):
         self.x, self.y, self.theta = x, y, theta
-        self.v, self.omega = 0.0, 0.0
+        self.v = self.omega = 0.0
 
 
-def simulate_husky(husky, wheel_funcs, T=5.0, dt=0.01):
-    """
-    Simula el movimiento del Husky A200.
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  LiDAR 2D simulado
+# ══════════════════════════════════════════════════════════════════════════════
+class LiDAR2D:
+    def __init__(self, n_beams=360, fov_deg=270., max_range=9., noise_std=0.015):
+        self.n_beams   = n_beams
+        self.fov       = np.radians(fov_deg)
+        self.max_range = max_range
+        self.noise_std = noise_std
+        self.angles    = np.linspace(-self.fov/2, self.fov/2, n_beams, endpoint=False)
 
-    Entradas:
-        husky       : instancia de HuskyA200
-        wheel_funcs : tupla (wR1_func, wR2_func, wL1_func, wL2_func)
-                      cada una funcion de t -> rad/s
-        T           : tiempo de simulacion [s]
-        dt          : paso de tiempo [s]
+    def scan(self, pose, boxes):
+        rx, ry, rt = pose
+        ranges = np.full(self.n_beams, self.max_range)
+        for i, a in enumerate(self.angles):
+            dx, dy = np.cos(rt+a), np.sin(rt+a)
+            for b in boxes:
+                if not b.active: continue
+                t = _ray_aabb(rx, ry, dx, dy,
+                              b.x-b.w/2, b.y-b.h/2, b.x+b.w/2, b.y+b.h/2)
+                if t is not None and t < ranges[i]:
+                    ranges[i] = t
+        return np.clip(ranges + np.random.normal(0, self.noise_std, self.n_beams),
+                       0, self.max_range)
 
-    Retorna:
-        dict con trayectorias de pose, 4 velocidades de rueda, y velocidades del cuerpo.
-    """
-    husky.reset()
-    wR1_func, wR2_func, wL1_func, wL2_func = wheel_funcs
-    n_steps = int(T / dt)
-    log = {k: np.zeros(n_steps) for k in
-           ['t', 'x', 'y', 'theta',
-            'wR1', 'wR2', 'wL1', 'wL2', 'v', 'omega']}
-
-    for i in range(n_steps):
-        t = i * dt
-        wR1 = wR1_func(t)
-        wR2 = wR2_func(t)
-        wL1 = wL1_func(t)
-        wL2 = wL2_func(t)
-        v, omega = husky.forward_kinematics(wR1, wR2, wL1, wL2)
-        husky.update_pose(v, omega, dt)
-
-        log['t'][i] = t
-        log['x'][i] = husky.x
-        log['y'][i] = husky.y
-        log['theta'][i] = husky.theta
-        log['wR1'][i] = wR1
-        log['wR2'][i] = wR2
-        log['wL1'][i] = wL1
-        log['wL2'][i] = wL2
-        log['v'][i] = v
-        log['omega'][i] = omega
-
-    return log
+    def nearest_box(self, pose, ranges, boxes):
+        """Caja activa más cercana según el retorno LiDAR."""
+        rx, ry, rt = pose
+        active = [b for b in boxes if b.active]
+        if not active: return None
+        bi = int(np.argmin(ranges))
+        if ranges[bi] >= self.max_range - 0.05:
+            return min(active, key=lambda b: np.hypot(b.x-rx, b.y-ry))
+        ang = self.angles[bi] + rt
+        wx  = rx + ranges[bi]*np.cos(ang)
+        wy  = ry + ranges[bi]*np.sin(ang)
+        return min(active, key=lambda b: np.hypot(b.x-wx, b.y-wy))
 
 
-def plot_husky_trajectory(log, title="Husky A200 - Trayectoria y Actuadores",
-                          save_path=None):
-    """
-    Grafica la trayectoria y las velocidades de los 4 actuadores del Husky.
-
-    Los actuadores del Husky son los 4 motores DC (FL, FR, RL, RR).
-
-    Genera una figura con 4 subplots:
-        1. Trayectoria XY con flechas de orientacion
-        2. Velocidades angulares de las 4 ruedas (actuadores)
-        3. Velocidades del cuerpo (v, omega)
-        4. Orientacion theta vs tiempo
-    """
-    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
-    fig.suptitle(title, fontsize=14, fontweight='bold')
-
-    # --- Subplot 1: trayectoria XY ---
-    ax = axes[0, 0]
-    ax.plot(log['x'], log['y'], 'b-', linewidth=2, label='Trayectoria')
-    ax.plot(log['x'][0], log['y'][0], 'go', markersize=10, label='Inicio')
-    ax.plot(log['x'][-1], log['y'][-1], 'rs', markersize=10, label='Fin')
-    step = max(1, len(log['t']) // 20)
-    for i in range(0, len(log['t']), step):
-        dx = 0.3 * np.cos(log['theta'][i])
-        dy = 0.3 * np.sin(log['theta'][i])
-        ax.arrow(log['x'][i], log['y'][i], dx, dy,
-                 head_width=0.08, head_length=0.08, fc='orange', ec='orange')
-    ax.set_xlabel('x [m]')
-    ax.set_ylabel('y [m]')
-    ax.set_title('Trayectoria en el plano XY')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect('equal', adjustable='datalim')
-
-    # --- Subplot 2: velocidades de las 4 ruedas (actuadores) ---
-    ax = axes[0, 1]
-    ax.plot(log['t'], log['wR1'], 'b-', linewidth=2, label=r'$\omega_{R1}$ (FR)')
-    ax.plot(log['t'], log['wR2'], 'b--', linewidth=2, label=r'$\omega_{R2}$ (RR)')
-    ax.plot(log['t'], log['wL1'], 'r-', linewidth=2, label=r'$\omega_{L1}$ (FL)')
-    ax.plot(log['t'], log['wL2'], 'r--', linewidth=2, label=r'$\omega_{L2}$ (RL)')
-    ax.set_xlabel('Tiempo [s]')
-    ax.set_ylabel('Velocidad angular [rad/s]')
-    ax.set_title('Actuadores: 4 ruedas del Husky')
-    ax.legend(loc='best', fontsize=9)
-    ax.grid(True, alpha=0.3)
-
-    # --- Subplot 3: velocidades del cuerpo ---
-    ax = axes[1, 0]
-    ax2 = ax.twinx()
-    l1 = ax.plot(log['t'], log['v'], 'g-', linewidth=2, label='v [m/s]')
-    l2 = ax2.plot(log['t'], log['omega'], 'm-', linewidth=2, label=r'$\omega$ [rad/s]')
-    ax.set_xlabel('Tiempo [s]')
-    ax.set_ylabel('Velocidad lineal v [m/s]', color='g')
-    ax2.set_ylabel(r'Velocidad angular $\omega$ [rad/s]', color='m')
-    ax.tick_params(axis='y', labelcolor='g')
-    ax2.tick_params(axis='y', labelcolor='m')
-    ax.set_title('Velocidades del cuerpo')
-    lines = l1 + l2
-    ax.legend(lines, [l.get_label() for l in lines], loc='best')
-    ax.grid(True, alpha=0.3)
-
-    # --- Subplot 4: orientacion ---
-    ax = axes[1, 1]
-    ax.plot(log['t'], np.degrees(log['theta']), 'k-', linewidth=2)
-    ax.set_xlabel('Tiempo [s]')
-    ax.set_ylabel(r'$\theta$ [deg]')
-    ax.set_title('Orientacion del robot')
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"  -> Figura guardada en {save_path}")
-    return fig
-
-
-def demo_husky():
-    """Ejemplos de movimiento del Husky A200 con graficacion."""
-    print("=" * 70)
-    print("DEMO Husky A200")
-    print("=" * 70)
-
-    husky = HuskyA200()
-
-    # --- Ejemplo 1: avance recto sobre asfalto ---
-    print("\n[1] Avance recto sobre asfalto")
-    husky.set_terrain("asphalt")
-    log1 = simulate_husky(husky,
-                          wheel_funcs=(lambda t: 3.0, lambda t: 3.0,
-                                       lambda t: 3.0, lambda t: 3.0),
-                          T=4.0)
-    print(f"    Pose final: x={log1['x'][-1]:.3f}, y={log1['y'][-1]:.3f}")
-    plot_husky_trajectory(log1, title="Husky Ejemplo 1: Recto en asfalto",
-                          save_path="husky_ej1_recto.png")
-
-    # --- Ejemplo 2: giro sobre pasto (con slip) ---
-    print("\n[2] Giro sobre pasto (slip=0.85)")
-    husky.set_terrain("grass")
-    log2 = simulate_husky(husky,
-                          wheel_funcs=(lambda t: 4.0, lambda t: 4.0,
-                                       lambda t: 1.5, lambda t: 1.5),
-                          T=6.0)
-    print(f"    Pose final: x={log2['x'][-1]:.3f}, y={log2['y'][-1]:.3f}, "
-          f"theta={np.degrees(log2['theta'][-1]):.1f} deg")
-    plot_husky_trajectory(log2, title="Husky Ejemplo 2: Giro en pasto",
-                          save_path="husky_ej2_giro.png")
-
-    # --- Ejemplo 3: trayectoria en S (cambio de direccion de giro) ---
-    print("\n[3] Trayectoria en S (cambio de direccion de giro)")
-    husky.set_terrain("asphalt")
-
-    def wheel_S(t):
-        """Genera comando en S: primero gira a la derecha, luego a la izquierda."""
-        if t < 3.0:
-            return 4.0, 2.0     # giro derecha
+def _ray_aabb(ox, oy, dx, dy, x0, y0, x1, y1):
+    tmin, tmax = 0., 1e9
+    for o, d, lo, hi in [(ox,dx,x0,x1),(oy,dy,y0,y1)]:
+        if abs(d)<1e-10:
+            if o<lo or o>hi: return None
         else:
-            return 2.0, 4.0     # giro izquierda
+            t1,t2 = sorted([(lo-o)/d,(hi-o)/d])
+            tmin,tmax = max(tmin,t1), min(tmax,t2)
+            if tmin>tmax: return None
+    return tmin if tmin>1e-6 else None
 
-    def wR_s(t): return wheel_S(t)[0]
-    def wL_s(t): return wheel_S(t)[1]
 
-    log3 = simulate_husky(husky,
-                          wheel_funcs=(wR_s, wR_s, wL_s, wL_s),
-                          T=6.0)
-    print(f"    Pose final: x={log3['x'][-1]:.3f}, y={log3['y'][-1]:.3f}")
-    plot_husky_trajectory(log3, title="Husky Ejemplo 3: Trayectoria en S",
-                          save_path="husky_ej3_S.png")
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  Caja 2D  (obstáculo físico)
+# ══════════════════════════════════════════════════════════════════════════════
+class Box2D:
+    def __init__(self, name, x, y, w=BOX_S, h=BOX_S, mass=25.):
+        self.name = name
+        self.x, self.y = float(x), float(y)
+        self.w, self.h = w, h
+        self.mass   = mass
+        self.active = True
 
-    # --- Ejemplo 4: comparacion de terrenos (misma entrada, diferente slip) ---
-    print("\n[4] Comparacion de 4 terrenos con la misma entrada")
-    terrains = ["asphalt", "grass", "gravel", "sand"]
-    fig, ax = plt.subplots(figsize=(8, 7))
-    for terrain in terrains:
-        husky.set_terrain(terrain)
-        log = simulate_husky(husky,
-                             wheel_funcs=(lambda t: 4.0, lambda t: 4.0,
-                                          lambda t: 2.0, lambda t: 2.0),
-                             T=6.0)
-        slip = husky._slip_factors[terrain]
-        ax.plot(log['x'], log['y'], linewidth=2,
-                label=f"{terrain} (slip={slip})")
-    ax.set_xlabel('x [m]')
-    ax.set_ylabel('y [m]')
-    ax.set_title('Husky A200: comparacion de terrenos (misma entrada)')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    ax.set_aspect('equal', adjustable='datalim')
-    plt.tight_layout()
-    plt.savefig("husky_ej4_terrenos.png", dpi=150, bbox_inches='tight')
-    print("  -> Figura guardada en husky_ej4_terrenos.png")
+    @property
+    def xmin(self): return self.x - self.w/2
+    @property
+    def xmax(self): return self.x + self.w/2
+    @property
+    def ymin(self): return self.y - self.h/2
+    @property
+    def ymax(self): return self.y + self.h/2
 
+    def track_husky(self, hx):
+        """Durante PUSH la caja sigue al frente (izquierdo) del Husky."""
+        self.x = hx - CONTACT
+
+    def is_outside(self): return self.x < EXIT_X
+    def __repr__(self):
+        return f"Box2D({self.name}, x={self.x:.2f}, y={self.y:.2f}, active={self.active})"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  Controlador P  (goto point)
+# ══════════════════════════════════════════════════════════════════════════════
+class GoTo:
+    """Navegar a un punto: primero gira, luego avanza."""
+    def __init__(self, k_v=0.80, k_w=2.50,
+                 v_max=0.70, w_max=1.50, tol=0.10):
+        self.k_v, self.k_w     = k_v, k_w
+        self.v_max, self.w_max = v_max, w_max
+        self.tol = tol
+
+    def __call__(self, pose, goal):
+        """(v, omega, reached)"""
+        x, y, theta = pose
+        gx, gy = goal
+        dist = np.hypot(gx-x, gy-y)
+        if dist < self.tol: return 0., 0., True
+        ag = np.arctan2(gy-y, gx-x)
+        ae = np.arctan2(np.sin(ag-theta), np.cos(ag-theta))
+        if abs(ae) > 0.08:
+            return 0., float(np.clip(self.k_w*ae, -self.w_max, self.w_max)), False
+        v = float(np.clip(self.k_v*dist, 0, self.v_max))
+        w = float(np.clip(self.k_w*ae,  -self.w_max, self.w_max))
+        return v, w, False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  Máquina de estados: HuskyPusher
+# ══════════════════════════════════════════════════════════════════════════════
+class HuskyPusher:
+    """
+    SCAN → ALIGN → APPROACH → PUSH → NEXT → DONE
+
+    El Husky rodea las cajas por el carril superior (LANE_Y = +0.72 m).
+    Empuje en dirección −X (←).
+    """
+
+    def __init__(self, husky, lidar, boxes, dt=0.05):
+        self.husky, self.lidar, self.boxes = husky, lidar, boxes
+        self.dt     = dt
+        self.goto   = GoTo()
+        self.state  = "SCAN"
+        self.target = None
+        self._ag    = None   # align_goal
+        self._apg   = None   # approach_goal
+        self._last_cmd  = (0., 0.)
+        self._last_meas = (0., 0.)
+        self.t = 0.
+        self.log = {
+            't':[], 'x':[], 'y':[], 'theta':[],
+            'v_cmd':[], 'omega_cmd':[],
+            'v_meas':[], 'omega_meas':[],
+            'state':[],
+            'box_x': {b.name:[] for b in boxes},
+            'box_y': {b.name:[] for b in boxes},
+        }
+
+    # ── API ──────────────────────────────────────────────────────────────────
+    def step(self) -> bool:
+        if self.state == "DONE": return True
+        pose = self.husky.get_pose()
+        { "SCAN":     self._scan,
+          "ALIGN":    self._align,
+          "APPROACH": self._approach,
+          "PUSH":     self._push,
+          "NEXT":     self._next,
+        }[self.state](pose)
+        self._log(pose)
+        self.t += self.dt
+        return self.state == "DONE"
+
+    def run(self, max_steps=12000):
+        for _ in range(max_steps):
+            if self.step():
+                print("[HuskyPusher] DONE ✓ — corredor despejado")
+                return True, self.log
+        print("[HuskyPusher] TIMEOUT")
+        return False, self.log
+
+    def check_success(self):
+        return all(not (0<=b.x<=6 and -1<=b.y<=1) for b in self.boxes)
+
+    def _active_boxes(self):
+        return [b for b in self.boxes if b.active]
+
+    # ── SCAN ─────────────────────────────────────────────────────────────────
+    def _scan(self, pose):
+        """Subir al carril (control directo) y luego detectar con LiDAR."""
+        _, y, theta = pose
+
+        # ─ Entrada al carril: control directo (sin PointFollower) ─
+        y_err = LANE_Y - y
+        if abs(y_err) > 0.06:
+            # Orientar hacia ±Y según la dirección necesaria
+            theta_target = np.pi/2 if y_err > 0 else -np.pi/2
+            t_err = np.arctan2(np.sin(theta_target - theta),
+                               np.cos(theta_target - theta))
+            if abs(t_err) > 0.08:
+                self._apply(0., float(np.clip(2.5*t_err, -1.5, 1.5)))
+            else:
+                v = float(np.clip(0.9 * abs(y_err), 0.08, 0.6))
+                self._apply(v, float(np.clip(1.0*t_err, -0.5, 0.5)))
+            return
+
+        # ─ En el carril: detectar la siguiente caja ─
+        active = self._active_boxes()
+        if not active:
+            self.state = "DONE"; return
+
+        ranges = self.lidar.scan(pose, self.boxes)
+        box    = self.lidar.nearest_box(pose, ranges, self.boxes)
+        if box is None:
+            box = min(active, key=lambda b: b.x)
+
+        self.target = box
+        self._ag    = (box.x + STAGE,   LANE_Y)    # staging en el carril
+        self._apg   = (box.x + CONTACT, box.y)     # punto de contacto
+        print(f"[SCAN]     Caja {box.name} ({box.x:.2f},{box.y:.2f}) | "
+              f"align=({self._ag[0]:.2f},{self._ag[1]:.2f})")
+        self.state = "ALIGN"
+
+    # ── ALIGN ────────────────────────────────────────────────────────────────
+    def _align(self, pose):
+        """Avanzar por el carril hasta el staging point."""
+        x, y, _ = pose
+        v, w, _ = self.goto(pose, self._ag)
+        v, w    = self._col(v, w, pose)
+        self._apply(v, w)
+        if np.hypot(x-self._ag[0], y-self._ag[1]) < 0.14:
+            print("[ALIGN]    Staging OK → bajando a contacto")
+            self.state = "APPROACH"
+
+    # ── APPROACH ─────────────────────────────────────────────────────────────
+    def _approach(self, pose):
+        """Bajar desde el carril hasta contactar el lado derecho de la caja."""
+        x, y, _ = pose
+        v, w, reached = self.goto(pose, self._apg)
+        v, w = self._col(v, w, pose, skip=self.target)
+        self._apply(v, w)
+        if reached or np.hypot(x-self._apg[0], y-self._apg[1]) < 0.10:
+            print(f"[APPROACH] Contacto con {self.target.name} → PUSH")
+            self.state = "PUSH"
+
+    # ── PUSH ─────────────────────────────────────────────────────────────────
+    def _push(self, pose):
+        """
+        1. Girar hasta theta = π  (mirar −X).
+        2. Avanzar en −X arrastrando la caja.
+        """
+        _, y, theta = pose
+        box = self.target
+
+        # Alinear orientación a π
+        err = np.arctan2(np.sin(np.pi - theta), np.cos(np.pi - theta))
+        if abs(err) > 0.06:
+            self._apply(0., float(np.clip(2.5*err, -1.5, 1.5)))
+            return
+
+        # Avanzar: v>0 con θ=π → dx/dt = −v  (hacia la izquierda ✓)
+        y_corr = float(np.clip(1.5*(box.y - y), -0.3, 0.3))
+        self._apply(PUSH_V, y_corr)
+        box.track_husky(self.husky.x)        # caja pegada al frente
+        self._resolve_box_contacts(box)
+
+        if box.is_outside():
+            print(f"[PUSH]     Caja {box.name} fuera → x={box.x:.2f}")
+            box.active = False
+            self.state = "NEXT"
+
+    def _resolve_box_contacts(self, source_box):
+        """Evita solapes caja-caja y propaga empuje entre cajas en contacto."""
+        moved = True
+        min_dx = BOX_S
+        y_overlap_tol = BOX_S * 0.9
+
+        while moved:
+            moved = False
+            for other in self.boxes:
+                if other is source_box:
+                    continue
+
+                # Solo propaga empuje si ambas cajas comparten prácticamente carril en Y.
+                if abs(other.y - source_box.y) > y_overlap_tol:
+                    continue
+
+                dx = source_box.x - other.x
+                if abs(dx) < min_dx:
+                    # Mantener separación mínima para cuerpos sólidos.
+                    if dx <= 0:
+                        other.x = source_box.x + min_dx
+                    else:
+                        other.x = source_box.x - min_dx
+                    source_box = other
+                    moved = True
+                    break
+
+    # ── NEXT ─────────────────────────────────────────────────────────────────
+    def _next(self, pose):
+        remaining = self._active_boxes()
+        if remaining:
+            print(f"[NEXT]     Quedan {len(remaining)} caja(s) → SCAN")
+            self.state = "SCAN"
+        else:
+            self.state = "DONE"
+
+    # ── Colisión AABB ────────────────────────────────────────────────────────
+    def _col(self, v, w, pose, skip=None):
+        """Cancela avance si el siguiente paso intersecta una caja activa."""
+        if v <= 0: return v, w
+        x, y, theta = pose
+        nx = x + v*np.cos(theta)*self.dt
+        ny = y + v*np.sin(theta)*self.dt
+        hw, hh = HUSKY_W/2, HUSKY_H/2
+        m = COL_MARGIN
+        for b in self.boxes:
+            if not b.active or b is skip: continue
+            if (nx+hw+m > b.xmin and nx-hw-m < b.xmax and
+                ny+hh+m > b.ymin and ny-hh-m < b.ymax):
+                return 0., w
+        return v, w
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def _apply(self, v_cmd, w_cmd):
+        wR, _, wL, _ = self.husky.inverse_kinematics(v_cmd, w_cmd)
+        n = np.random.normal(0, 0.008, 4)
+        vm, wm = self.husky.forward_kinematics(wR+n[0],wR+n[1],wL+n[2],wL+n[3])
+        self.husky.update_pose(vm, wm, self.dt)
+        self._last_cmd  = (v_cmd, w_cmd)
+        self._last_meas = (vm, wm)
+
+    def _log(self, pose):
+        x, y, theta = pose
+        self.log['t'].append(self.t)
+        self.log['x'].append(x);  self.log['y'].append(y)
+        self.log['theta'].append(theta)
+        self.log['v_cmd'].append(self._last_cmd[0])
+        self.log['omega_cmd'].append(self._last_cmd[1])
+        self.log['v_meas'].append(self._last_meas[0])
+        self.log['omega_meas'].append(self._last_meas[1])
+        self.log['state'].append(self.state)
+        for b in self.boxes:
+            self.log['box_x'][b.name].append(b.x)
+            self.log['box_y'][b.name].append(b.y)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  Escenario y demo
+# ══════════════════════════════════════════════════════════════════════════════
+def make_scenario():
+    np.random.seed(42)
+    husky = HuskyA200()
+    husky.reset(x=-2.0, y=0.0, theta=0.0)
+    lidar = LiDAR2D()
+    boxes = [Box2D("1",1.,0.), Box2D("2",3.,0.), Box2D("3",5.,0.)]
+    return husky, lidar, boxes
+
+
+def demo_husky_pusher():
+    print("="*65)
+    print("DEMO  Husky A200 — Fase 1  (empuje ←)")
+    print("="*65)
+    husky, lidar, boxes = make_scenario()
+    pusher = HuskyPusher(husky, lidar, boxes, dt=0.05)
+    ok, log = pusher.run(max_steps=15000)
+    print(f"\nÉxito: {ok}  |  Despejado: {pusher.check_success()}")
+    for b in boxes: print(f"  {b}")
+    print(f"  Tiempo sim: {log['t'][-1]:.1f} s")
+
+    out_dir = Path(__file__).resolve().parent.parent / "results"
+    png_path = out_dir / "husky_pusher_snapshot.png"
+    gif_path = out_dir / "husky_pusher_run.gif"
+    save_husky_snapshot(log, boxes, png_path)
+    save_husky_gif(log, gif_path)
+    print(f"  Imagen: {png_path}")
+    print(f"  GIF:    {gif_path}")
+
+    return log, boxes
+
+
+if __name__ == "__main__":
+    demo_husky_pusher()
