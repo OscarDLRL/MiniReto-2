@@ -5,12 +5,6 @@ Fases: SCAN → ALIGN → APPROACH → PUSH → NEXT → DONE
 """
 
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib import animation
-from pathlib import Path
 
 # ── Constantes ────────────────────────────────────────────────────────────────
 HUSKY_W    = 0.90
@@ -22,147 +16,6 @@ STAGE      = CONTACT  + 0.30              # 1.025 m  (staging a la derecha)
 PUSH_V     = 0.35                          # m/s de empuje
 EXIT_X     = -0.35                         # caja "fuera" cuando box.x < EXIT_X
 COL_MARGIN = 0.03                          # holgura en colisión [m]
-
-# Carril central
-def _draw_world(ax, show_side_zones=True):
-    ax.set_xlim(-4.5, 12.5)
-    ax.set_ylim(-2.0, 2.0)
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(True, alpha=0.25)
-    ax.axvline(0.0, color="gray", lw=1.0, ls="--", alpha=0.5)
-    ax.axvline(6.0, color="gray", lw=1.0, ls="--", alpha=0.5)
-    ax.axhline(-1.0, color="gray", lw=1.0, ls=":", alpha=0.6)
-    ax.axhline(1.0, color="gray", lw=1.0, ls=":", alpha=0.6)
-    ax.axhline(LANE_Y, color="#1f77b4", lw=1.2, ls="-.", alpha=0.7)
-
-    ax.add_patch(mpatches.Rectangle((0.0, -1.0), 6.0, 2.0,
-                                    facecolor="#fff8e8", edgecolor="none", alpha=0.45))
-    if show_side_zones:
-        ax.add_patch(mpatches.Rectangle((-4.0, -2.0), 4.0, 4.0,
-                                        facecolor="#e9f5ff", edgecolor="none", alpha=0.35))
-        ax.add_patch(mpatches.Rectangle((6.0, -2.0), 6.0, 4.0,
-                                        facecolor="#ecffef", edgecolor="none", alpha=0.35))
-
-    ax.set_xlabel("x [m]")
-    ax.set_ylabel("y [m]")
-
-# POligono orientado del Husky para visualización
-def _robot_corners(x, y, theta):
-    local = np.array([
-        [-HUSKY_W/2, -HUSKY_H/2],
-        [ HUSKY_W/2, -HUSKY_H/2],
-        [ HUSKY_W/2,  HUSKY_H/2],
-        [-HUSKY_W/2,  HUSKY_H/2],
-    ])
-    ct, st = np.cos(theta), np.sin(theta)
-    rot = np.array([[ct, -st], [st, ct]])
-    return local @ rot.T + np.array([x, y])
-
-
-# Polígono orientado del Husky para visualización (patch de Matplotlib)
-def _robot_patch(x, y, theta, facecolor="#2b2d42"):
-    return mpatches.Polygon(
-        _robot_corners(x, y, theta),
-        closed=True,
-        facecolor=facecolor,
-        edgecolor="black",
-        linewidth=1.2,
-        zorder=4,
-    )
-
-# Guardar imagen resumen con trayectoria y estado final
-def save_husky_snapshot(log, boxes, out_path):
-    """Guarda una imagen resumen con trayectoria y estado final."""
-    fig, ax = plt.subplots(figsize=(12, 5))
-    _draw_world(ax)
-    ax.set_title("Husky A200 - Fase 1 (trayectoria y estado final)")
-
-    x = np.array(log["x"])
-    y = np.array(log["y"])
-    th = np.array(log["theta"])
-
-    ax.plot(x, y, color="#0b5d1e", lw=2.0, label="Trayectoria Husky", zorder=3)
-    ax.scatter([x[0]], [y[0]], s=50, color="#1f77b4", zorder=5, label="Inicio Husky")
-    ax.scatter([x[-1]], [y[-1]], s=55, color="#d62728", zorder=5, label="Fin Husky")
-
-    robot = _robot_patch(x[-1], y[-1], th[-1])
-    ax.add_patch(robot)
-
-    for b in boxes:
-        color = "#2ca02c" if not b.active else "#ff7f0e"
-        label = f"Caja {b.name} ({'fuera' if not b.active else 'activa'})"
-        ax.add_patch(mpatches.Rectangle(
-            (b.x - b.w/2, b.y - b.h/2), b.w, b.h,
-            facecolor=color, edgecolor="black", alpha=0.75, zorder=4, label=label
-        ))
-
-    handles, labels = ax.get_legend_handles_labels()
-    uniq = {}
-    for h, l in zip(handles, labels):
-        if l not in uniq:
-            uniq[l] = h
-    ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=9)
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=160)
-    plt.close(fig)
-
-
-# Guardar animación GIF de la simulación
-def save_husky_gif(log, out_path, step_stride=4, fps=15):
-    """Guarda GIF de la simulación usando muestras del log."""
-    x = np.array(log["x"])
-    y = np.array(log["y"])
-    th = np.array(log["theta"])
-    box_names = list(log["box_x"].keys())
-    bx = {k: np.array(v) for k, v in log["box_x"].items()}
-    by = {k: np.array(v) for k, v in log["box_y"].items()}
-
-    idx = np.arange(0, len(x), max(1, step_stride), dtype=int)
-    if idx[-1] != len(x) - 1:
-        idx = np.append(idx, len(x) - 1)
-
-    fig, ax = plt.subplots(figsize=(12, 5))
-    _draw_world(ax, show_side_zones=False)
-    ax.set_title("Husky A200 - Fase 1 (animacion)")
-
-    path_line, = ax.plot([], [], color="#0b5d1e", lw=2.0, zorder=3)
-    husky = _robot_patch(x[0], y[0], th[0])
-    ax.add_patch(husky)
-    heading, = ax.plot([], [], color="#111111", lw=2.0, zorder=5)
-    txt = ax.text(0.02, 0.96, "", transform=ax.transAxes, va="top", fontsize=10)
-
-    box_patches = {}
-    for name in box_names:
-        patch = mpatches.Rectangle((bx[name][0]-BOX_S/2, by[name][0]-BOX_S/2), BOX_S, BOX_S,
-                                   facecolor="#ff7f0e", edgecolor="black", alpha=0.8, zorder=4)
-        ax.add_patch(patch)
-        box_patches[name] = patch
-
-    def _update(k):
-        i = idx[k]
-        path_line.set_data(x[:i+1], y[:i+1])
-
-        husky.set_xy(_robot_corners(x[i], y[i], th[i]))
-
-        hx2 = x[i] + 0.45*np.cos(th[i])
-        hy2 = y[i] + 0.45*np.sin(th[i])
-        heading.set_data([x[i], hx2], [y[i], hy2])
-
-        for name in box_names:
-            box_patches[name].set_xy((bx[name][i]-BOX_S/2, by[name][i]-BOX_S/2))
-            if bx[name][i] < EXIT_X:
-                box_patches[name].set_facecolor("#2ca02c")
-
-        txt.set_text(f"t = {log['t'][i]:.1f} s | estado = {log['state'][i]}")
-        return [path_line, husky, heading, txt, *box_patches.values()]
-
-    ani = animation.FuncAnimation(fig, _update, frames=len(idx), interval=1000/fps, blit=True)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    ani.save(out_path, writer=animation.PillowWriter(fps=fps))
-    plt.close(fig)
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 1.  Husky A200
@@ -229,7 +82,6 @@ class LiDAR2D:
                        0, self.max_range)
 
     def nearest_box(self, pose, ranges, boxes):
-        """Caja activa más cercana según el retorno LiDAR."""
         rx, ry, rt = pose
         active = [b for b in boxes if b.active]
         if not active: return None
@@ -275,7 +127,6 @@ class Box2D:
     def ymax(self): return self.y + self.h/2
 
     def track_husky(self, hx):
-        """Durante PUSH la caja sigue al frente (izquierdo) del Husky."""
         self.x = hx - CONTACT
 
     def is_outside(self): return self.x < EXIT_X
@@ -295,7 +146,6 @@ class GoTo:
         self.tol = tol
 
     def __call__(self, pose, goal):
-        """(v, omega, reached)"""
         x, y, theta = pose
         gx, gy = goal
         dist = np.hypot(gx-x, gy-y)
@@ -357,7 +207,7 @@ class HuskyPusher:
     def run(self, max_steps=12000):
         for _ in range(max_steps):
             if self.step():
-                print("[HuskyPusher] DONE ✓ — corredor despejado")
+                print("[HuskyPusher] DONE — corredor despejado")
                 return True, self.log
         print("[HuskyPusher] TIMEOUT")
         return False, self.log
@@ -550,14 +400,6 @@ def demo_husky_pusher():
     print(f"\nÉxito: {ok}  |  Despejado: {pusher.check_success()}")
     for b in boxes: print(f"  {b}")
     print(f"  Tiempo sim: {log['t'][-1]:.1f} s")
-
-    out_dir = Path(__file__).resolve().parent.parent / "results"
-    png_path = out_dir / "husky_pusher_snapshot.png"
-    gif_path = out_dir / "husky_pusher_run.gif"
-    save_husky_snapshot(log, boxes, png_path)
-    save_husky_gif(log, gif_path)
-    print(f"  Imagen: {png_path}")
-    print(f"  GIF:    {gif_path}")
 
     return log, boxes
 
