@@ -1,408 +1,420 @@
 """
-husky_pusher.py  —  Fase 1: Husky A200 despeja el corredor
-===========================================================
-Fases: SCAN → ALIGN → APPROACH → PUSH → NEXT → DONE
+husky_pusher.py
+
+Modelo 2D sencillo del Husky A200 para la fase 1 del mini reto.
+El objetivo es detectar/empujar 3 cajas grandes fuera del corredor y dejar
+el paso libre para el ANYmal.
+
+No es una simulación dinámica realista; es una abstracción cinemática con:
+- skid-steer simplificado
+- compensación de deslizamiento mediante factor s
+- máquina de estados local por caja
+- "LiDAR" 2D muy simple a partir de los obstáculos conocidos
+- logs de velocidades comandadas y medidas
 """
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import List, Optional, Tuple
 
 import numpy as np
 
-# ── Constantes ────────────────────────────────────────────────────────────────
-HUSKY_W    = 0.90
-HUSKY_H    = 0.58
-BOX_S      = 0.55                          # lado de la caja [m]
-LANE_Y     = +0.72                         # carril superior
-CONTACT    = HUSKY_W/2 + BOX_S/2          # 0.725 m  (centro-centro al contactar)
-STAGE      = CONTACT  + 0.30              # 1.025 m  (staging a la derecha)
-PUSH_V     = 0.35                          # m/s de empuje
-EXIT_X     = -0.35                         # caja "fuera" cuando box.x < EXIT_X
-COL_MARGIN = 0.03                          # holgura en colisión [m]
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1.  Husky A200
-# ══════════════════════════════════════════════════════════════════════════════
-class HuskyA200:
-    """Skid-steer 4 ruedas con factor de deslizamiento."""
+@dataclass
+class BoxObstacle:
+    """Caja grande a empujar fuera del corredor."""
 
-    def __init__(self, r=0.1651, B=0.555, mass=50.0):
-        self.r, self.B, self.mass = r, B, mass
-        self.x = self.y = self.theta = 0.0
-        self.v = self.omega = 0.0
-        self.terrain = "asphalt"
-        self._slip = {"asphalt":1.00,"grass":0.85,
-                      "gravel":0.78,"sand":0.65,"mud":0.50}
-
-    def forward_kinematics(self, wR1, wR2, wL1, wL2):
-        s = self._slip.get(self.terrain, 0.8)
-        v = self.r/2 * ((wR1+wR2)/2 + (wL1+wL2)/2) * s
-        w = self.r/self.B * ((wR1+wR2)/2 - (wL1+wL2)/2)
-        return v, w
-
-    def inverse_kinematics(self, v, omega):
-        wR = (2*v + omega*self.B) / (2*self.r)
-        wL = (2*v - omega*self.B) / (2*self.r)
-        return wR, wR, wL, wL
-
-    def update_pose(self, v, omega, dt):
-        tm = self.theta + omega*dt/2
-        self.x     += v*np.cos(tm)*dt
-        self.y     += v*np.sin(tm)*dt
-        self.theta += omega*dt
-        self.theta  = np.arctan2(np.sin(self.theta), np.cos(self.theta))
-        self.v, self.omega = v, omega
-
-    def get_pose(self):  return (self.x, self.y, self.theta)
-    def reset(self, x=0., y=0., theta=0.):
-        self.x, self.y, self.theta = x, y, theta
-        self.v = self.omega = 0.0
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 2.  LiDAR 2D simulado
-# ══════════════════════════════════════════════════════════════════════════════
-class LiDAR2D:
-    def __init__(self, n_beams=360, fov_deg=270., max_range=9., noise_std=0.015):
-        self.n_beams   = n_beams
-        self.fov       = np.radians(fov_deg)
-        self.max_range = max_range
-        self.noise_std = noise_std
-        self.angles    = np.linspace(-self.fov/2, self.fov/2, n_beams, endpoint=False)
-
-    def scan(self, pose, boxes):
-        rx, ry, rt = pose
-        ranges = np.full(self.n_beams, self.max_range)
-        for i, a in enumerate(self.angles):
-            dx, dy = np.cos(rt+a), np.sin(rt+a)
-            for b in boxes:
-                if not b.active: continue
-                t = _ray_aabb(rx, ry, dx, dy,
-                              b.x-b.w/2, b.y-b.h/2, b.x+b.w/2, b.y+b.h/2)
-                if t is not None and t < ranges[i]:
-                    ranges[i] = t
-        return np.clip(ranges + np.random.normal(0, self.noise_std, self.n_beams),
-                       0, self.max_range)
-
-    def nearest_box(self, pose, ranges, boxes):
-        rx, ry, rt = pose
-        active = [b for b in boxes if b.active]
-        if not active: return None
-        bi = int(np.argmin(ranges))
-        if ranges[bi] >= self.max_range - 0.05:
-            return min(active, key=lambda b: np.hypot(b.x-rx, b.y-ry))
-        ang = self.angles[bi] + rt
-        wx  = rx + ranges[bi]*np.cos(ang)
-        wy  = ry + ranges[bi]*np.sin(ang)
-        return min(active, key=lambda b: np.hypot(b.x-wx, b.y-wy))
-
-
-def _ray_aabb(ox, oy, dx, dy, x0, y0, x1, y1):
-    tmin, tmax = 0., 1e9
-    for o, d, lo, hi in [(ox,dx,x0,x1),(oy,dy,y0,y1)]:
-        if abs(d)<1e-10:
-            if o<lo or o>hi: return None
-        else:
-            t1,t2 = sorted([(lo-o)/d,(hi-o)/d])
-            tmin,tmax = max(tmin,t1), min(tmax,t2)
-            if tmin>tmax: return None
-    return tmin if tmin>1e-6 else None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3.  Caja 2D  (obstáculo físico)
-# ══════════════════════════════════════════════════════════════════════════════
-class Box2D:
-    def __init__(self, name, x, y, w=BOX_S, h=BOX_S, mass=25.):
-        self.name = name
-        self.x, self.y = float(x), float(y)
-        self.w, self.h = w, h
-        self.mass   = mass
-        self.active = True
+    center: np.ndarray
+    size: np.ndarray
+    push_dir: int
+    cleared: bool = False
 
     @property
-    def xmin(self): return self.x - self.w/2
+    def x(self) -> float:
+        return float(self.center[0])
+
     @property
-    def xmax(self): return self.x + self.w/2
+    def y(self) -> float:
+        return float(self.center[1])
+
     @property
-    def ymin(self): return self.y - self.h/2
+    def width(self) -> float:
+        return float(self.size[0])
+
     @property
-    def ymax(self): return self.y + self.h/2
+    def height(self) -> float:
+        return float(self.size[1])
 
-    def track_husky(self, hx):
-        self.x = hx - CONTACT
+    def bounds(self) -> Tuple[float, float, float, float]:
+        """Retorna xmin, xmax, ymin, ymax."""
+        half = 0.5 * self.size
+        return (
+            float(self.center[0] - half[0]),
+            float(self.center[0] + half[0]),
+            float(self.center[1] - half[1]),
+            float(self.center[1] + half[1]),
+        )
 
-    def is_outside(self): return self.x < EXIT_X
-    def __repr__(self):
-        return f"Box2D({self.name}, x={self.x:.2f}, y={self.y:.2f}, active={self.active})"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4.  Controlador P  (goto point)
-# ══════════════════════════════════════════════════════════════════════════════
-class GoTo:
-    """Navegar a un punto: primero gira, luego avanza."""
-    def __init__(self, k_v=0.80, k_w=2.50,
-                 v_max=0.70, w_max=1.50, tol=0.10):
-        self.k_v, self.k_w     = k_v, k_w
-        self.v_max, self.w_max = v_max, w_max
-        self.tol = tol
-
-    def __call__(self, pose, goal):
-        x, y, theta = pose
-        gx, gy = goal
-        dist = np.hypot(gx-x, gy-y)
-        if dist < self.tol: return 0., 0., True
-        ag = np.arctan2(gy-y, gx-x)
-        ae = np.arctan2(np.sin(ag-theta), np.cos(ag-theta))
-        if abs(ae) > 0.08:
-            return 0., float(np.clip(self.k_w*ae, -self.w_max, self.w_max)), False
-        v = float(np.clip(self.k_v*dist, 0, self.v_max))
-        w = float(np.clip(self.k_w*ae,  -self.w_max, self.w_max))
-        return v, w, False
+    def is_outside_corridor(self, x0: float, x1: float, y0: float, y1: float) -> bool:
+        """Verdadero si la caja ya no intersecta el rectángulo del corredor."""
+        xmin, xmax, ymin, ymax = self.bounds()
+        overlap_x = not (xmax < x0 or xmin > x1)
+        overlap_y = not (ymax < y0 or ymin > y1)
+        return not (overlap_x and overlap_y)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5.  Máquina de estados: HuskyPusher
-# ══════════════════════════════════════════════════════════════════════════════
-class HuskyPusher:
+class HuskyPusher2D:
     """
-    SCAN → ALIGN → APPROACH → PUSH → NEXT → DONE
+    Simulador cinemático simple del Husky A200 para empujar cajas.
 
-    El Husky rodea las cajas por el carril superior (LANE_Y = +0.72 m).
-    Empuje en dirección −X (←).
+    Flujo por caja:
+      1) navegar a una pose previa de empuje
+      2) alinearse con la dirección de empuje
+      3) empujar hasta sacar la caja del corredor
+      4) retirarse un poco
+      5) continuar con la siguiente caja
     """
 
-    def __init__(self, husky, lidar, boxes, dt=0.05):
-        self.husky, self.lidar, self.boxes = husky, lidar, boxes
-        self.dt     = dt
-        self.goto   = GoTo()
-        self.state  = "SCAN"
-        self.target = None
-        self._ag    = None   # align_goal
-        self._apg   = None   # approach_goal
-        self._last_cmd  = (0., 0.)
-        self._last_meas = (0., 0.)
-        self.t = 0.
-        self.log = {
-            't':[], 'x':[], 'y':[], 'theta':[],
-            'v_cmd':[], 'omega_cmd':[],
-            'v_meas':[], 'omega_meas':[],
-            'state':[],
-            'box_x': {b.name:[] for b in boxes},
-            'box_y': {b.name:[] for b in boxes},
+    def __init__(
+        self,
+        pose: Tuple[float, float, float] = (0.7, -1.9, 0.0),
+        wheel_radius: float = 0.1651,
+        track_width: float = 0.555,
+        body_length: float = 0.95,
+        body_width: float = 0.62,
+        slip_factor: float = 0.85,
+        corridor: Tuple[float, float, float, float] = (2.0, 8.0, -1.0, 1.0),
+        parking_pose: Tuple[float, float, float] = (1.10, -2.35, 0.0),
+        lidar_range: float = 4.0,
+        max_v_cmd: float = 0.75,
+        max_w_cmd: float = 1.25,
+    ) -> None:
+        self.pose = np.array(pose, dtype=float)
+        self.wheel_radius = float(wheel_radius)
+        self.track_width = float(track_width)
+        self.body_length = float(body_length)
+        self.body_width = float(body_width)
+        self.slip_factor = float(slip_factor)
+        self.corridor = tuple(float(v) for v in corridor)
+        self.parking_pose = np.array(parking_pose, dtype=float)
+        self.lidar_range = float(lidar_range)
+        self.max_v_cmd = float(max_v_cmd)
+        self.max_w_cmd = float(max_w_cmd)
+
+        self.time = 0.0
+        self.path = [self.pose[:2].copy()]
+
+        self.current_box_index = 0
+        self.state = "goto_prepush"
+        self.state_time = 0.0
+        self.finished = False
+        self.parked_aside = False
+        self.last_contact = False
+        self.retreat_goal_pose: Optional[np.ndarray] = None
+
+        self.logs = {
+            "time": [],
+            "x": [],
+            "y": [],
+            "theta": [],
+            "v_cmd": [],
+            "w_cmd": [],
+            "v_meas": [],
+            "w_meas": [],
+            "left_w_cmd": [],
+            "right_w_cmd": [],
+            "left_w_meas": [],
+            "right_w_meas": [],
+            "state": [],
+            "box_index": [],
+            "contact": [],
         }
 
-    # ── API ──────────────────────────────────────────────────────────────────
-    def step(self) -> bool:
-        if self.state == "DONE": return True
-        pose = self.husky.get_pose()
-        { "SCAN":     self._scan,
-          "ALIGN":    self._align,
-          "APPROACH": self._approach,
-          "PUSH":     self._push,
-          "NEXT":     self._next,
-        }[self.state](pose)
-        self._log(pose)
-        self.t += self.dt
-        return self.state == "DONE"
+    # ------------------------------------------------------------------
+    # Utilidades geométricas
+    # ------------------------------------------------------------------
+    @staticmethod
+    def wrap_to_pi(angle: float) -> float:
+        return (angle + math.pi) % (2.0 * math.pi) - math.pi
 
-    def run(self, max_steps=12000):
-        for _ in range(max_steps):
-            if self.step():
-                print("[HuskyPusher] DONE — corredor despejado")
-                return True, self.log
-        print("[HuskyPusher] TIMEOUT")
-        return False, self.log
+    def rot2(self, theta: float) -> np.ndarray:
+        c = math.cos(theta)
+        s = math.sin(theta)
+        return np.array([[c, -s], [s, c]], dtype=float)
 
-    def check_success(self):
-        return all(not (0<=b.x<=6 and -1<=b.y<=1) for b in self.boxes)
+    def body_corners_world(self) -> np.ndarray:
+        """Esquinas del Husky para dibujo."""
+        hx = 0.5 * self.body_length
+        hy = 0.5 * self.body_width
+        corners_body = np.array(
+            [[+hx, +hy], [+hx, -hy], [-hx, -hy], [-hx, +hy], [+hx, +hy]],
+            dtype=float,
+        )
+        return (self.rot2(self.pose[2]) @ corners_body.T).T + self.pose[:2]
 
-    def _active_boxes(self):
-        return [b for b in self.boxes if b.active]
+    def front_point(self) -> np.ndarray:
+        """Punto frontal del robot, útil para verificar contacto."""
+        return self.pose[:2] + self.rot2(self.pose[2]) @ np.array([0.5 * self.body_length, 0.0])
 
-    # ── SCAN ─────────────────────────────────────────────────────────────────
-    def _scan(self, pose):
-        """Subir al carril (control directo) y luego detectar con LiDAR."""
-        _, y, theta = pose
+    # ------------------------------------------------------------------
+    # Modelo cinemático skid-steer
+    # ------------------------------------------------------------------
+    def body_twist_to_wheels(self, v: float, w: float) -> Tuple[float, float]:
+        """Convierte v,w en velocidades angulares de lado derecho/izquierdo."""
+        omega_r = (v + 0.5 * self.track_width * w) / self.wheel_radius
+        omega_l = (v - 0.5 * self.track_width * w) / self.wheel_radius
+        return float(omega_l), float(omega_r)
 
-        # ─ Entrada al carril: control directo (sin PointFollower) ─
-        y_err = LANE_Y - y
-        if abs(y_err) > 0.06:
-            # Orientar hacia ±Y según la dirección necesaria
-            theta_target = np.pi/2 if y_err > 0 else -np.pi/2
-            t_err = np.arctan2(np.sin(theta_target - theta),
-                               np.cos(theta_target - theta))
-            if abs(t_err) > 0.08:
-                self._apply(0., float(np.clip(2.5*t_err, -1.5, 1.5)))
-            else:
-                v = float(np.clip(0.9 * abs(y_err), 0.08, 0.6))
-                self._apply(v, float(np.clip(1.0*t_err, -0.5, 0.5)))
-            return
-
-        # ─ En el carril: detectar la siguiente caja ─
-        active = self._active_boxes()
-        if not active:
-            self.state = "DONE"; return
-
-        ranges = self.lidar.scan(pose, self.boxes)
-        box    = self.lidar.nearest_box(pose, ranges, self.boxes)
-        if box is None:
-            box = min(active, key=lambda b: b.x)
-
-        self.target = box
-        self._ag    = (box.x + STAGE,   LANE_Y)    # staging en el carril
-        self._apg   = (box.x + CONTACT, box.y)     # punto de contacto
-        print(f"[SCAN]     Caja {box.name} ({box.x:.2f},{box.y:.2f}) | "
-              f"align=({self._ag[0]:.2f},{self._ag[1]:.2f})")
-        self.state = "ALIGN"
-
-    # ── ALIGN ────────────────────────────────────────────────────────────────
-    def _align(self, pose):
-        """Avanzar por el carril hasta el staging point."""
-        x, y, _ = pose
-        v, w, _ = self.goto(pose, self._ag)
-        v, w    = self._col(v, w, pose)
-        self._apply(v, w)
-        if np.hypot(x-self._ag[0], y-self._ag[1]) < 0.14:
-            print("[ALIGN]    Staging OK → bajando a contacto")
-            self.state = "APPROACH"
-
-    # ── APPROACH ─────────────────────────────────────────────────────────────
-    def _approach(self, pose):
-        """Bajar desde el carril hasta contactar el lado derecho de la caja."""
-        x, y, _ = pose
-        v, w, reached = self.goto(pose, self._apg)
-        v, w = self._col(v, w, pose, skip=self.target)
-        self._apply(v, w)
-        if reached or np.hypot(x-self._apg[0], y-self._apg[1]) < 0.10:
-            print(f"[APPROACH] Contacto con {self.target.name} → PUSH")
-            self.state = "PUSH"
-
-    # ── PUSH ─────────────────────────────────────────────────────────────────
-    def _push(self, pose):
+    def wheels_to_body_twist_measured(self, omega_l_cmd: float, omega_r_cmd: float) -> Tuple[float, float, float, float]:
         """
-        1. Girar hasta theta = π  (mirar −X).
-        2. Avanzar en −X arrastrando la caja.
+        Aplica deslizamiento al avance lineal y deja casi intacta la rotación.
+        Esto sigue la idea de que el factor s afecta sobre todo la traslación.
         """
-        _, y, theta = pose
-        box = self.target
+        v_cmd = 0.5 * self.wheel_radius * (omega_r_cmd + omega_l_cmd)
+        w_cmd = self.wheel_radius * (omega_r_cmd - omega_l_cmd) / self.track_width
 
-        # Alinear orientación a π
-        err = np.arctan2(np.sin(np.pi - theta), np.cos(np.pi - theta))
-        if abs(err) > 0.06:
-            self._apply(0., float(np.clip(2.5*err, -1.5, 1.5)))
-            return
+        v_meas = self.slip_factor * v_cmd
+        w_meas = w_cmd
 
-        # Avanzar: v>0 con θ=π → dx/dt = −v  (hacia la izquierda ✓)
-        y_corr = float(np.clip(1.5*(box.y - y), -0.3, 0.3))
-        self._apply(PUSH_V, y_corr)
-        box.track_husky(self.husky.x)        # caja pegada al frente
-        self._resolve_box_contacts(box)
+        omega_r_meas = (v_meas + 0.5 * self.track_width * w_meas) / self.wheel_radius
+        omega_l_meas = (v_meas - 0.5 * self.track_width * w_meas) / self.wheel_radius
+        return float(v_meas), float(w_meas), float(omega_l_meas), float(omega_r_meas)
 
-        if box.is_outside():
-            print(f"[PUSH]     Caja {box.name} fuera → x={box.x:.2f}")
-            box.active = False
-            self.state = "NEXT"
+    def integrate(self, dt: float, v_meas: float, w_meas: float) -> None:
+        theta_mid = self.pose[2] + 0.5 * w_meas * dt
+        self.pose[0] += v_meas * math.cos(theta_mid) * dt
+        self.pose[1] += v_meas * math.sin(theta_mid) * dt
+        self.pose[2] = self.wrap_to_pi(self.pose[2] + w_meas * dt)
+        self.path.append(self.pose[:2].copy())
 
-    def _resolve_box_contacts(self, source_box):
-        """Evita solapes caja-caja y propaga empuje entre cajas en contacto."""
-        moved = True
-        min_dx = BOX_S
-        y_overlap_tol = BOX_S * 0.9
+    # ------------------------------------------------------------------
+    # Planeación local simple
+    # ------------------------------------------------------------------
+    def _current_box(self, boxes: List[BoxObstacle]) -> Optional[BoxObstacle]:
+        if self.current_box_index >= len(boxes):
+            self.finished = True
+            return None
+        return boxes[self.current_box_index]
 
-        while moved:
-            moved = False
-            for other in self.boxes:
-                if other is source_box:
-                    continue
+    def _push_heading(self, box: BoxObstacle) -> float:
+        return math.pi / 2.0 if box.push_dir > 0 else -math.pi / 2.0
 
-                # Solo propaga empuje si ambas cajas comparten prácticamente carril en Y.
-                if abs(other.y - source_box.y) > y_overlap_tol:
-                    continue
+    def _prepush_pose(self, box: BoxObstacle) -> np.ndarray:
+        """Pose desde la cual el Husky inicia el empuje de la caja."""
+        heading = self._push_heading(box)
+        margin = 0.16
+        offset_y = box.push_dir * (0.5 * box.height + 0.5 * self.body_length + margin)
+        # Para empujar hacia arriba, se coloca debajo; hacia abajo, arriba.
+        pre_y = box.y - offset_y
+        return np.array([box.x, pre_y, heading], dtype=float)
 
-                dx = source_box.x - other.x
-                if abs(dx) < min_dx:
-                    # Mantener separación mínima para cuerpos sólidos.
-                    if dx <= 0:
-                        other.x = source_box.x + min_dx
-                    else:
-                        other.x = source_box.x - min_dx
-                    source_box = other
-                    moved = True
-                    break
+    def _retreat_goal(self, box: BoxObstacle) -> np.ndarray:
+        heading = self._push_heading(box)
+        retreat = 0.55
+        return np.array([self.pose[0], self.pose[1] - box.push_dir * retreat, heading], dtype=float)
 
-    # ── NEXT ─────────────────────────────────────────────────────────────────
-    def _next(self, pose):
-        remaining = self._active_boxes()
-        if remaining:
-            print(f"[NEXT]     Quedan {len(remaining)} caja(s) → SCAN")
-            self.state = "SCAN"
+    def _goto_pose_controller(self, goal_pose: np.ndarray) -> Tuple[float, float]:
+        """Control proporcional sencillo a una pose objetivo."""
+        dx = goal_pose[0] - self.pose[0]
+        dy = goal_pose[1] - self.pose[1]
+        dist = float(np.hypot(dx, dy))
+
+        desired_heading = math.atan2(dy, dx)
+        heading_error = self.wrap_to_pi(desired_heading - self.pose[2])
+        final_heading_error = self.wrap_to_pi(goal_pose[2] - self.pose[2])
+
+        if dist > 0.18:
+            v_cmd = np.clip(0.9 * dist, -self.max_v_cmd, self.max_v_cmd)
+            v_cmd *= max(0.2, math.cos(heading_error))
+            w_cmd = np.clip(2.4 * heading_error, -self.max_w_cmd, self.max_w_cmd)
         else:
-            self.state = "DONE"
+            v_cmd = 0.0
+            w_cmd = np.clip(2.0 * final_heading_error, -self.max_w_cmd, self.max_w_cmd)
 
-    # ── Colisión AABB ────────────────────────────────────────────────────────
-    def _col(self, v, w, pose, skip=None):
-        """Cancela avance si el siguiente paso intersecta una caja activa."""
-        if v <= 0: return v, w
-        x, y, theta = pose
-        nx = x + v*np.cos(theta)*self.dt
-        ny = y + v*np.sin(theta)*self.dt
-        hw, hh = HUSKY_W/2, HUSKY_H/2
-        m = COL_MARGIN
-        for b in self.boxes:
-            if not b.active or b is skip: continue
-            if (nx+hw+m > b.xmin and nx-hw-m < b.xmax and
-                ny+hh+m > b.ymin and ny-hh-m < b.ymax):
-                return 0., w
-        return v, w
+        return float(v_cmd), float(w_cmd)
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
-    def _apply(self, v_cmd, w_cmd):
-        wR, _, wL, _ = self.husky.inverse_kinematics(v_cmd, w_cmd)
-        n = np.random.normal(0, 0.008, 4)
-        vm, wm = self.husky.forward_kinematics(wR+n[0],wR+n[1],wL+n[2],wL+n[3])
-        self.husky.update_pose(vm, wm, self.dt)
-        self._last_cmd  = (v_cmd, w_cmd)
-        self._last_meas = (vm, wm)
+    def _ready_for_push(self, box: BoxObstacle) -> bool:
+        prep = self._prepush_pose(box)
+        pos_ok = np.linalg.norm(self.pose[:2] - prep[:2]) < 0.18
+        ang_ok = abs(self.wrap_to_pi(self.pose[2] - prep[2])) < 0.12
+        return bool(pos_ok and ang_ok)
 
-    def _log(self, pose):
-        x, y, theta = pose
-        self.log['t'].append(self.t)
-        self.log['x'].append(x);  self.log['y'].append(y)
-        self.log['theta'].append(theta)
-        self.log['v_cmd'].append(self._last_cmd[0])
-        self.log['omega_cmd'].append(self._last_cmd[1])
-        self.log['v_meas'].append(self._last_meas[0])
-        self.log['omega_meas'].append(self._last_meas[1])
-        self.log['state'].append(self.state)
-        for b in self.boxes:
-            self.log['box_x'][b.name].append(b.x)
-            self.log['box_y'][b.name].append(b.y)
+    def _contact_with_box(self, box: BoxObstacle) -> bool:
+        front = self.front_point()
+        xmin, xmax, ymin, ymax = box.bounds()
+        heading_ok = abs(self.wrap_to_pi(self.pose[2] - self._push_heading(box))) < 0.18
+
+        if box.push_dir > 0:
+            close_y = abs(front[1] - ymin) < 0.18
+        else:
+            close_y = abs(front[1] - ymax) < 0.18
+
+        inside_x = (xmin - 0.15) <= front[0] <= (xmax + 0.15)
+        return bool(heading_ok and close_y and inside_x)
+
+    def _push_box_if_contact(self, box: BoxObstacle, dt: float, v_meas: float) -> bool:
+        """Si hay contacto, mueve la caja junto con el Husky."""
+        contact = self._contact_with_box(box)
+        if not contact:
+            return False
+
+        # Solo mover sobre el eje y para sacar la caja del corredor.
+        dy = box.push_dir * max(0.0, v_meas) * dt
+        box.center[1] += dy
+
+        x0, x1, y0, y1 = self.corridor
+        if box.is_outside_corridor(x0, x1, y0, y1):
+            box.cleared = True
+        return True
+
+    def reached_parking_pose(self) -> bool:
+        """Verdadero si el Husky ya está en su pose lateral."""
+        pos_ok = np.linalg.norm(self.pose[:2] - self.parking_pose[:2]) < 0.22
+        ang_ok = abs(self.wrap_to_pi(self.pose[2] - self.parking_pose[2])) < 0.18
+        return bool(pos_ok and ang_ok)
+
+    def lidar_scan(self, boxes: List[BoxObstacle], num_beams: int = 90) -> np.ndarray:
+        """
+        LiDAR 2D super simple.
+        Regresa puntos detectados sobre el perímetro de las cajas que estén dentro de rango.
+        """
+        pts = []
+        origin = self.pose[:2]
+        for box in boxes:
+            xmin, xmax, ymin, ymax = box.bounds()
+            xs = np.linspace(xmin, xmax, 8)
+            ys = np.linspace(ymin, ymax, 8)
+            perimeter = []
+            perimeter.extend([(x, ymin) for x in xs])
+            perimeter.extend([(x, ymax) for x in xs])
+            perimeter.extend([(xmin, y) for y in ys])
+            perimeter.extend([(xmax, y) for y in ys])
+            for p in perimeter:
+                p = np.array(p, dtype=float)
+                if np.linalg.norm(p - origin) <= self.lidar_range:
+                    pts.append(p)
+        if len(pts) == 0:
+            return np.zeros((0, 2), dtype=float)
+        return np.array(pts, dtype=float)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 6.  Escenario y demo
-# ══════════════════════════════════════════════════════════════════════════════
-def make_scenario():
-    np.random.seed(42)
-    husky = HuskyA200()
-    husky.reset(x=-2.0, y=0.0, theta=0.0)
-    lidar = LiDAR2D()
-    boxes = [Box2D("1",1.,0.), Box2D("2",3.,0.), Box2D("3",5.,0.)]
-    return husky, lidar, boxes
+    def simulate_lidar(self, boxes: List[BoxObstacle]) -> np.ndarray:
+        """Alias conveniente para la visualización."""
+        return self.lidar_scan(boxes)
 
+    # ------------------------------------------------------------------
+    # Loop principal
+    # ------------------------------------------------------------------
+    def update(self, dt: float, boxes: List[BoxObstacle]) -> dict:
+        dt = float(dt)
+        self.time += dt
+        self.state_time += dt
 
-def demo_husky_pusher():
-    print("="*65)
-    print("DEMO  Husky A200 — Fase 1  (empuje ←)")
-    print("="*65)
-    husky, lidar, boxes = make_scenario()
-    pusher = HuskyPusher(husky, lidar, boxes, dt=0.05)
-    ok, log = pusher.run(max_steps=15000)
-    print(f"\nÉxito: {ok}  |  Despejado: {pusher.check_success()}")
-    for b in boxes: print(f"  {b}")
-    print(f"  Tiempo sim: {log['t'][-1]:.1f} s")
+        box = self._current_box(boxes)
+        if box is None:
+            if not self.parked_aside:
+                self.state = "park_aside"
+                v_cmd, w_cmd = self._goto_pose_controller(self.parking_pose)
+                if self.reached_parking_pose():
+                    self.pose = self.parking_pose.copy()
+                    self.path.append(self.pose[:2].copy())
+                    self.parked_aside = True
+                    self.finished = True
+                    v_cmd = w_cmd = 0.0
+            else:
+                self.finished = True
+                v_cmd = w_cmd = 0.0
+        else:
+            if self.state == "goto_prepush":
+                goal = self._prepush_pose(box)
+                v_cmd, w_cmd = self._goto_pose_controller(goal)
+                if self._ready_for_push(box):
+                    self.state = "push"
+                    self.state_time = 0.0
 
-    return log, boxes
+            elif self.state == "push":
+                # Avanza hacia un punto más allá del corredor manteniendo la orientación
+                # de empuje. Esto hace la fase de empuje bastante estable en 2D.
+                y_goal = (self.corridor[3] + 0.95) if box.push_dir > 0 else (self.corridor[2] - 0.95)
+                push_goal = np.array([box.x, y_goal, self._push_heading(box)], dtype=float)
+                v_cmd, w_cmd = self._goto_pose_controller(push_goal)
+                v_cmd = max(0.28, v_cmd)
 
+                # Si la caja ya salió, ir a retiro.
+                x0, x1, y0, y1 = self.corridor
+                if box.is_outside_corridor(x0, x1, y0, y1):
+                    box.cleared = True
+                    self.state = "retreat"
+                    self.state_time = 0.0
+                    self.retreat_goal_pose = self._retreat_goal(box)
 
-if __name__ == "__main__":
-    demo_husky_pusher()
+            elif self.state == "retreat":
+                goal = self.retreat_goal_pose if self.retreat_goal_pose is not None else self._retreat_goal(box)
+                heading_error = self.wrap_to_pi(self._push_heading(box) - self.pose[2])
+                v_cmd = -0.35
+                w_cmd = np.clip(2.0 * heading_error, -self.max_w_cmd, self.max_w_cmd)
+                if np.linalg.norm(self.pose[:2] - goal[:2]) < 0.12:
+                    self.current_box_index += 1
+                    self.state = "goto_prepush"
+                    self.state_time = 0.0
+                    self.retreat_goal_pose = None
+                    v_cmd = 0.0
+                    w_cmd = 0.0
+
+            else:
+                v_cmd = 0.0
+                w_cmd = 0.0
+
+        # Limitar y pasar a ruedas.
+        v_cmd = float(np.clip(v_cmd, -self.max_v_cmd, self.max_v_cmd))
+        w_cmd = float(np.clip(w_cmd, -self.max_w_cmd, self.max_w_cmd))
+        omega_l_cmd, omega_r_cmd = self.body_twist_to_wheels(v_cmd, w_cmd)
+        v_meas, w_meas, omega_l_meas, omega_r_meas = self.wheels_to_body_twist_measured(omega_l_cmd, omega_r_cmd)
+
+        # Integración y empuje.
+        self.integrate(dt, v_meas, w_meas)
+        contact = False
+        active_box = self._current_box(boxes)
+        if active_box is not None and self.state == "push":
+            contact = self._push_box_if_contact(active_box, dt, v_meas)
+            if active_box.cleared:
+                self.state = "retreat"
+                self.state_time = 0.0
+                self.retreat_goal_pose = self._retreat_goal(active_box)
+
+        self.last_contact = contact
+
+        # Si ya no quedan cajas, el robot pasa a estacionarse a un lado.
+        if self._current_box(boxes) is None and self.parked_aside:
+            self.finished = True
+
+        # Logs.
+        self.logs["time"].append(self.time)
+        self.logs["x"].append(self.pose[0])
+        self.logs["y"].append(self.pose[1])
+        self.logs["theta"].append(self.pose[2])
+        self.logs["v_cmd"].append(v_cmd)
+        self.logs["w_cmd"].append(w_cmd)
+        self.logs["v_meas"].append(v_meas)
+        self.logs["w_meas"].append(w_meas)
+        self.logs["left_w_cmd"].append(omega_l_cmd)
+        self.logs["right_w_cmd"].append(omega_r_cmd)
+        self.logs["left_w_meas"].append(omega_l_meas)
+        self.logs["right_w_meas"].append(omega_r_meas)
+        self.logs["state"].append(self.state)
+        self.logs["box_index"].append(self.current_box_index)
+        self.logs["contact"].append(contact)
+
+        return {
+            "state": self.state,
+            "current_box": self.current_box_index,
+            "finished": self.finished,
+            "contact": contact,
+            "lidar": self.lidar_scan(boxes),
+            "v_cmd": v_cmd,
+            "w_cmd": w_cmd,
+            "v_meas": v_meas,
+            "w_meas": w_meas,
+        }
