@@ -162,9 +162,7 @@ class AnymalGait2D:
             for leg in LEG_ORDER
         }
 
-    # ---------------------------------------------------------------------
     # Transformaciones
-    # ---------------------------------------------------------------------
     def rot2(self, theta: float) -> np.ndarray:
         """Matriz de rotación 2D."""
         c = math.cos(theta)
@@ -193,9 +191,7 @@ class AnymalGait2D:
         """Posición del hip de una pata en mundo."""
         return self.body_to_world(self.hip_anchors_body[leg])
 
-    # ---------------------------------------------------------------------
-    # Kinemática de pata
-    # ---------------------------------------------------------------------
+    # Cinemática de pata
     def forward_kinematics_leg(self, q: np.ndarray, leg: str) -> np.ndarray:
         """
         FK de una pata en el marco del hip.
@@ -285,9 +281,7 @@ class AnymalGait2D:
         singular = abs(detJ) < self.detj_threshold
         return LegState(q=q, detJ=detJ, singular=singular, reachable=reachable)
 
-    # ---------------------------------------------------------------------
     # Planeación de marcha
-    # ---------------------------------------------------------------------
     def desired_command_to_goal(self, goal_xy: np.ndarray) -> Tuple[float, float]:
         """
         Control proporcional simple para mover el cuerpo hacia la meta.
@@ -375,9 +369,7 @@ class AnymalGait2D:
             self.swing_start_world[leg] = self.feet_world[leg].copy()
             self.swing_target_world[leg] = self._plan_touchdown_world(leg, v_cmd=v_cmd, omega_cmd=omega_cmd)
 
-    # ---------------------------------------------------------------------
     # Integración
-    # ---------------------------------------------------------------------
     def update(self, dt: float, goal_xy: np.ndarray) -> Dict[str, LegState]:
         """
         Avanza un paso de simulación.
@@ -448,10 +440,8 @@ class AnymalGait2D:
             self.leg_logs[leg]["reachable"].append(st.reachable)
 
         return states
-
-    # ---------------------------------------------------------------------
+    
     # Utilidades de dibujo / métricas
-    # ---------------------------------------------------------------------
     def body_corners_world(self) -> np.ndarray:
         """Esquinas del rectángulo del cuerpo en mundo, para dibujar."""
         hx = 0.5 * self.body_length

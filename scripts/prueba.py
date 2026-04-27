@@ -6,8 +6,7 @@ from main import PuzzleBot, simulate_puzzlebot, plot_puzzlebot_trajectory
 from puzzlebot_arm import PuzzleBotArm 
 
 
-# ── Funciones existentes ────────────────────────────────────────────────────
-
+# Funciones existentes
 def prueba_linea_recta():
     print("\n=== PRUEBA 1: Línea recta ===")
     bot = PuzzleBot(r=0.05, L=0.19)
@@ -44,23 +43,23 @@ def prueba_espiral():
     plot_puzzlebot_trajectory(log, title="Prueba PuzzleBot - Espiral", save_path="prueba_espiral.png")
 
 
-# ── Nueva función: brazo ────────────────────────────────────────────────────
+# Nueva función: brazo
 
 def prueba_brazo():
     print("\n=== PRUEBA 5: PuzzleBotArm ===")
     arm = PuzzleBotArm(l1=0.10, l2=0.08, l3=0.06)
 
-    # --- FK en configuración home ---
+    # FK en configuración home
     q_home = np.array([0.0, np.pi / 6, np.pi / 4])
     p_home = arm.forward_kinematics(q_home)
     print(f"FK home -> p={p_home}")
 
-    # --- IK: recuperar q desde p_home ---
+    # IK: recuperar q desde p_home
     q_ik = arm.inverse_kinematics(p_home)
     p_check = arm.forward_kinematics(q_ik)
     print(f"IK check -> p={p_check}  (error={np.linalg.norm(p_check - p_home):.2e})")
 
-    # --- Jacobiano y torques ---
+    # Jacobiano y torques
     arm.forward_kinematics(q_home)
     J = arm.jacobian(q_home)
     print(f"Jacobiano:\n{J}")
@@ -68,7 +67,7 @@ def prueba_brazo():
     tau = arm.force_to_torque(f_tip)
     print(f"Torques para f={f_tip} -> tau={tau}")
 
-    # --- grasp_box hacia un objetivo alcanzable ---
+    # grasp_box hacia un objetivo alcanzable
     box_pos = p_home + np.array([0.02, 0.01, -0.02])
     try:
         result = arm.grasp_box(box_pos, grip_force=5.0)
@@ -77,7 +76,7 @@ def prueba_brazo():
     except ValueError as e:
         print(f"grasp_box ERROR: {e}")
 
-    # --- Gráfica de trayectoria cartesiana ---
+    # Gráfica de trayectoria cartesiana
     traj = np.array(result["trajectory_positions"])
     fig = plt.figure()
     ax = fig.add_subplot(111, projection="3d")
@@ -92,8 +91,7 @@ def prueba_brazo():
     print("Gráfica guardada en prueba_brazo.png")
 
 
-# ── Main ────────────────────────────────────────────────────────────────────
-
+# Main
 def main():
     prueba_linea_recta()
     prueba_arco()

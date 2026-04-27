@@ -132,9 +132,7 @@ class HuskyPusher2D:
             "contact": [],
         }
 
-    # ------------------------------------------------------------------
     # Utilidades geométricas
-    # ------------------------------------------------------------------
     @staticmethod
     def wrap_to_pi(angle: float) -> float:
         return (angle + math.pi) % (2.0 * math.pi) - math.pi
@@ -158,9 +156,7 @@ class HuskyPusher2D:
         """Punto frontal del robot, útil para verificar contacto."""
         return self.pose[:2] + self.rot2(self.pose[2]) @ np.array([0.5 * self.body_length, 0.0])
 
-    # ------------------------------------------------------------------
     # Modelo cinemático skid-steer
-    # ------------------------------------------------------------------
     def body_twist_to_wheels(self, v: float, w: float) -> Tuple[float, float]:
         """Convierte v,w en velocidades angulares de lado derecho/izquierdo."""
         omega_r = (v + 0.5 * self.track_width * w) / self.wheel_radius
@@ -189,9 +185,7 @@ class HuskyPusher2D:
         self.pose[2] = self.wrap_to_pi(self.pose[2] + w_meas * dt)
         self.path.append(self.pose[:2].copy())
 
-    # ------------------------------------------------------------------
     # Planeación local simple
-    # ------------------------------------------------------------------
     def _current_box(self, boxes: List[BoxObstacle]) -> Optional[BoxObstacle]:
         if self.current_box_index >= len(boxes):
             self.finished = True
@@ -304,9 +298,7 @@ class HuskyPusher2D:
         """Alias conveniente para la visualización."""
         return self.lidar_scan(boxes)
 
-    # ------------------------------------------------------------------
     # Loop principal
-    # ------------------------------------------------------------------
     def update(self, dt: float, boxes: List[BoxObstacle]) -> dict:
         dt = float(dt)
         self.time += dt
