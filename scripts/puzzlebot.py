@@ -2,12 +2,7 @@ from puzzlebot_arm import PuzzleBotArm
 import numpy as np
 import matplotlib.pyplot as plt
 
-
-################################################################################
-#                                                                              #
-#                    PARTE 1:  PuzzleBot  (robot diferencial)                  #
-#                                                                              #
-################################################################################
+# PARTE 1:  PuzzleBot  (robot diferencial)                  
 
 class PuzzleBot:
     """
@@ -25,17 +20,17 @@ class PuzzleBot:
     """
 
     def __init__(self, r=0.05, L=0.19, x=0.0, y=0.0):
-        # --- Parametros fisicos (calibrados con el robot real) ---
+        # Parametros fisicos (calibrados con el robot real)
         self.r = r              # Radio de la rueda [m]
         self.L = L              # Distancia entre ruedas [m]
 
-        # --- Estado interno: pose (x, y, theta) en marco mundo ---
+        # Estado interno: pose (x, y, theta) en marco mundo
         self.x = x            # Posicion X [m]
         self.y = y            # Posicion Y [m]
         self.theta = 0.0        # Orientacion [rad] en [-pi, pi]
         self.arm = PuzzleBotArm()
 
-        # --- Limites fisicos del robot (proteccion) ---
+        # Limites fisicos del robot (proteccion)
         self.v_max = 0.8        # Velocidad lineal maxima [m/s]
         self.omega_max = 3.0    # Velocidad angular maxima [rad/s]
 
@@ -190,7 +185,7 @@ def plot_puzzlebot_trajectory(log, title="PuzzleBot - Trayectoria y Actuadores",
     fig, axes = plt.subplots(2, 2, figsize=(12, 9))
     fig.suptitle(title, fontsize=14, fontweight='bold')
 
-    # --- Subplot 1: trayectoria XY ---
+    # Subplot 1: trayectoria XY
     ax = axes[0, 0]
     ax.plot(log['x'], log['y'], 'b-', linewidth=2, label='Trayectoria')
     ax.plot(log['x'][0], log['y'][0], 'go', markersize=10, label='Inicio')
@@ -209,7 +204,7 @@ def plot_puzzlebot_trajectory(log, title="PuzzleBot - Trayectoria y Actuadores",
     ax.grid(True, alpha=0.3)
     ax.set_aspect('equal', adjustable='datalim')
 
-    # --- Subplot 2: velocidades de los actuadores (ruedas) ---
+    # Subplot 2: velocidades de los actuadores (ruedas)
     ax = axes[0, 1]
     ax.plot(log['t'], log['wR'], 'b-', linewidth=2, label=r'$\omega_R$ (rueda der.)')
     ax.plot(log['t'], log['wL'], 'r-', linewidth=2, label=r'$\omega_L$ (rueda izq.)')
@@ -219,7 +214,7 @@ def plot_puzzlebot_trajectory(log, title="PuzzleBot - Trayectoria y Actuadores",
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Subplot 3: velocidades del cuerpo ---
+    # Subplot 3: velocidades del cuerpo
     ax = axes[1, 0]
     ax2 = ax.twinx()
     l1 = ax.plot(log['t'], log['v'], 'g-', linewidth=2, label='v [m/s]')
@@ -234,7 +229,7 @@ def plot_puzzlebot_trajectory(log, title="PuzzleBot - Trayectoria y Actuadores",
     ax.legend(lines, [l.get_label() for l in lines], loc='best')
     ax.grid(True, alpha=0.3)
 
-    # --- Subplot 4: orientacion ---
+    # Subplot 4: orientacion
     ax = axes[1, 1]
     ax.plot(log['t'], np.degrees(log['theta']), 'k-', linewidth=2)
     ax.set_xlabel('Tiempo [s]')
@@ -257,7 +252,7 @@ def demo_puzzlebot():
 
     bot = PuzzleBot(r=0.05, L=0.19)
 
-    # --- Ejemplo 1: avanzar en linea recta ---
+    # Ejemplo 1: avanzar en linea recta
     print("\n[1] Avanzar en linea recta (wR = wL = 10 rad/s)")
     log1 = simulate_puzzlebot(bot,
                               wR_func=lambda t: 10.0,
@@ -268,7 +263,7 @@ def demo_puzzlebot():
     plot_puzzlebot_trajectory(log1, title="PuzzleBot Ejemplo 1: Linea Recta",
                               save_path="puzzlebot_ej1_recta.png")
 
-    # --- Ejemplo 2: movimiento en arco ---
+    # Ejemplo 2: movimiento en arco
     print("\n[2] Movimiento en arco (wR=10, wL=8 rad/s)")
     log2 = simulate_puzzlebot(bot,
                               wR_func=lambda t: 10.0,
@@ -279,7 +274,7 @@ def demo_puzzlebot():
     plot_puzzlebot_trajectory(log2, title="PuzzleBot Ejemplo 2: Arco",
                               save_path="puzzlebot_ej2_arco.png")
 
-    # --- Ejemplo 3: espiral (velocidades variables en el tiempo) ---
+    # Ejemplo 3: espiral (velocidades variables en el tiempo)
     print("\n[3] Espiral (wL crece con el tiempo)")
     log3 = simulate_puzzlebot(bot,
                               wR_func=lambda t: 10.0,
@@ -290,7 +285,7 @@ def demo_puzzlebot():
     plot_puzzlebot_trajectory(log3, title="PuzzleBot Ejemplo 3: Espiral",
                               save_path="puzzlebot_ej3_espiral.png")
 
-    # --- Ejemplo 4: giro en el propio eje ---
+    # Ejemplo 4: giro en el propio eje
     print("\n[4] Giro sobre el propio eje (wR = -wL)")
     log4 = simulate_puzzlebot(bot,
                               wR_func=lambda t: 5.0,
