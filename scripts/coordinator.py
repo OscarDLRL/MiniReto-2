@@ -19,7 +19,7 @@ import numpy as np
 
 from anymal_gait import AnymalGait2D, LEG_ORDER
 from husky_pusher import BoxObstacle, HuskyPusher2D
-from puzzlebot_arm import PuzzleBot2D, SmallBox
+from puzzlebot_arm import PuzzleBot2D, SmallBox, RFNavigator
 
 
 DT_DEFAULT = 0.05
@@ -60,6 +60,9 @@ class MissionCoordinator:
 
         self.big_boxes = self._make_big_boxes()
         self.small_boxes = self._make_small_boxes()
+        puzzlebotnav = RFNavigator(max_objects=10)
+        puzzlebotnav.train(n_samples=10000)
+
 
         self.husky = HuskyPusher2D(corridor=CORRIDOR, parking_pose=PARKING_POSE)
         self.anymal = AnymalGait2D(
@@ -98,6 +101,9 @@ class MissionCoordinator:
             PuzzleBot2D(name=name, assigned_box=box_label, safe_pose=tuple(self.safe_poses[name]))
             for name, box_label in PB_ASSIGNMENTS.items()
         ]
+        for pb in self.puzzlebots:
+            pb.attach_rf_navigator(puzzlebotnav)
+
         self.pb_by_box = {pb.assigned_box: pb for pb in self.puzzlebots}
 
         self._update_payload_mounts()
@@ -208,6 +214,47 @@ class MissionCoordinator:
             f"Violaciones PB = {self.collision_violations}"
         )
 
+    def get_close_objects(
+        self,
+        pb: PuzzleBot2D,
+        radius: float = 1.5,
+    ) -> List[np.ndarray]:
+        """
+        Return XY positions of all objects within `radius` meters of `pb`.
+
+        Includes: other PuzzleBots, ANYmal body + feet, big boxes, small boxes.
+        """
+        origin = pb.pose[:2]
+        close: List[np.ndarray] = []
+
+        # Other PuzzleBots
+        for other in self.puzzlebots:
+            if other is pb:
+                continue
+            pos = other.pose[:2]
+            if np.linalg.norm(pos - origin) <= radius:
+                close.append(pos.copy())
+
+        # ANYmal body center + each foot
+        for center, _ in self.anymal_keepout_circles():
+            if np.linalg.norm(center - origin) <= radius:
+                close.append(center.copy())
+
+        # Big boxes (Husky obstacles)
+        for box in self.big_boxes:
+            pos = box.center[:2]
+            if np.linalg.norm(pos - origin) <= radius:
+                close.append(pos.copy())
+
+        # Small boxes (only if not yet placed / being carried)
+        for box in self.small_boxes.values():
+            if box.world_xy is not None and box.label !=  self._get_active_stack_box_label():
+                pos = np.asarray(box.world_xy[:2])
+                if np.linalg.norm(pos - origin) <= radius:
+                    close.append(pos.copy())
+
+        return close
+
     def update(self) -> MissionSnapshot:
         """Avanza una muestra de la misión completa."""
         self.time += self.dt
@@ -259,11 +306,13 @@ class MissionCoordinator:
 
         elif self.phase == "DEPLOY_PUZZLEBOTS":
             active_pb = self._get_active_deploy_pb()
+            close_objects = self.get_close_objects(active_pb, radius=1.5)  
             active_pb.update_deployment(
                 self.dt,
                 self.dismount_poses[active_pb.name],
                 self.safe_poses[active_pb.name],
                 self.time,
+                close_objects,                                              
             )
             for pb in self.puzzlebots:
                 if pb is not active_pb:
@@ -273,12 +322,14 @@ class MissionCoordinator:
                 self.deploy_index += 1
                 if self.deploy_index >= len(self.puzzlebots):
                     self.phase = "STACK_SEQUENCE"
+                    print("iniciando stack")
 
         elif self.phase == "STACK_SEQUENCE":
             box_label = self._get_active_stack_box_label()
             active_pb = self._get_active_stack_pb()
+            close_objects = self.get_close_objects(active_pb, radius=1.5)  
             box = self.small_boxes[box_label]
-            active_pb.update_task(self.dt, self.time, box, STACK_GOAL, self.stack_index, lane_x=DEPLOY_LANE_X)
+            active_pb.update_task(self.dt, self.time, box, STACK_GOAL, self.stack_index, lane_x=DEPLOY_LANE_X, close_objects=close_objects)
             if box.carried_by is not None:
                 box.world_xy = active_pb.grasp_point_world().copy()
 
@@ -290,10 +341,12 @@ class MissionCoordinator:
                 if box.label not in self.completed_stack_order:
                     self.completed_stack_order.append(box.label)
                 self.stack_index += 1
+                print("Puzzlebot Finished!")
                 if self.stack_index >= len(STACK_SEQUENCE):
                     self.success_flags["stack_complete"] = self._all_small_boxes_stacked()
                     self.success_flags["stack_order_ok"] = self.completed_stack_order == STACK_SEQUENCE
                     self.phase = "COMPLETE"
+                    print("Al Puzzlebots Done!")
 
         elif self.phase == "COMPLETE":
             self.success_flags["stack_complete"] = self._all_small_boxes_stacked()
