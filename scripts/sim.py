@@ -359,7 +359,7 @@ def run_demo() -> None:
             *payload_markers.values(),
         ]
 
-    _anim = FuncAnimation(
+    anim = FuncAnimation(
         fig,
         update,
         frames=MAX_FRAMES,
@@ -367,6 +367,11 @@ def run_demo() -> None:
         interval=int(DT * 1000),
         blit=False,
         repeat=False,
+    )
+    anim.save(
+    "simulacion.gif",
+    writer="pillow",
+    fps=20,
     )
 
     plt.show()
