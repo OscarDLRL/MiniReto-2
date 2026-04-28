@@ -362,7 +362,7 @@ def run_demo() -> None:
     anim = FuncAnimation(
         fig,
         update,
-        frames=MAX_FRAMES,
+        frames=None,
         init_func=init,
         interval=int(DT * 1000),
         blit=False,
