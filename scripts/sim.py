@@ -368,11 +368,6 @@ def run_demo() -> None:
         blit=False,
         repeat=False,
     )
-    anim.save(
-    "simulacion.gif",
-    writer="pillow",
-    fps=20,
-    )
 
     plt.show()
     plot_results(mission)
